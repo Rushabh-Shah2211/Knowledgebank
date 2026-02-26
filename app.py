@@ -12,33 +12,25 @@ import gspread
 from google.oauth2.service_account import Credentials
 from google.cloud import storage
 
-st.set_page_config(page_title="Enterprise Legal Knowledge Bank", layout="wide", page_icon="🏛️")
+st.set_page_config(page_title="RBS Legal Knowledge Bank", layout="wide", page_icon="🏛️")
 
 # --- Authentication & Cloud Setup ---
-# Loaded from Render Environment Variables
 GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 SHEET_ID = os.environ.get("SPREADSHEET_ID")
 GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME")
-api_key = os.environ.get("GEMINI_API_KEY") # Gemini API Key for AI interactions
+api_key = os.environ.get("GEMINI_API_KEY")
 
 @st.cache_resource
 def get_google_clients():
-    """Authenticates and returns Google Sheets and Cloud Storage clients."""
     if not GOOGLE_CREDS_JSON or not SHEET_ID or not GCS_BUCKET_NAME:
         return None, None
-    
     try:
         creds_dict = json.loads(GOOGLE_CREDS_JSON)
-        
-        # Sheets Client
         scopes = ['https://www.googleapis.com/auth/spreadsheets']
         sheet_creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
         gc = gspread.authorize(sheet_creds)
         sh = gc.open_by_key(SHEET_ID)
-        
-        # Cloud Storage Client
         storage_client = storage.Client.from_service_account_info(creds_dict)
-        
         return sh, storage_client
     except Exception as e:
         st.error(f"Google Auth Error: {e}")
@@ -47,16 +39,29 @@ def get_google_clients():
 sh, storage_client = get_google_clients()
 
 def init_sheets():
-    """Ensures headers exist in Google Sheets."""
     if sh:
         try:
+            worksheet_titles = [ws.title for ws in sh.worksheets()]
+            
+            if "Judgments" not in worksheet_titles:
+                sh.add_worksheet(title="Judgments", rows="1000", cols="10")
             judgments_sheet = sh.worksheet("Judgments")
             if not judgments_sheet.row_values(1):
                 judgments_sheet.append_row(["ID", "Case Name", "Act Name", "Section Number", "Authority", "Brief Facts", "Decision Held", "PDF File IDs", "AI Notes", "Status"])
                 
+            if "Internal Usage" not in worksheet_titles:
+                sh.add_worksheet(title="Internal Usage", rows="1000", cols="10")
             internal_sheet = sh.worksheet("Internal Usage")
             if not internal_sheet.row_values(1):
                 internal_sheet.append_row(["ID", "Judgment ID", "Internal Matter Name", "Internal Notice", "Usage Notes", "AI Brief"])
+                
+            # NEW: Notice Replies Sheet
+            if "Notice Replies" not in worksheet_titles:
+                sh.add_worksheet(title="Notice Replies", rows="1000", cols="10")
+            notice_sheet = sh.worksheet("Notice Replies")
+            if not notice_sheet.row_values(1):
+                notice_sheet.append_row(["ID", "Matter Name", "Notice Text", "Internal Judgments Used", "External References", "Final Reply"])
+                
         except Exception as e:
             st.error(f"Error initializing sheets: {e}")
 
@@ -65,19 +70,17 @@ if sh:
 
 # --- Google Cloud Storage File Handlers ---
 def upload_to_gcs(file_buffer, file_name):
-    """Uploads a file buffer to Google Cloud Storage and returns the filename."""
     try:
         bucket = storage_client.bucket(GCS_BUCKET_NAME)
         blob = bucket.blob(file_name)
         file_buffer.seek(0)
         blob.upload_from_file(file_buffer, content_type='application/pdf')
-        return file_name # In GCS, the filename acts as the ID
+        return file_name
     except Exception as e:
         st.error(f"GCS Upload Error: {e}")
         return None
 
 def download_from_gcs(file_name):
-    """Downloads a file from Google Cloud Storage into memory."""
     try:
         bucket = storage_client.bucket(GCS_BUCKET_NAME)
         blob = bucket.blob(file_name)
@@ -102,7 +105,7 @@ def extract_text_from_buffers(pdf_buffers):
 
 def ask_ai(prompt):
     if not api_key:
-        return None, "Error: Please enter your Gemini API Key in the sidebar."
+        return None, "Error: API Key is missing from Environment Variables."
     try:
         client = genai.Client(api_key=api_key)
         response = client.models.generate_content(
@@ -113,7 +116,7 @@ def ask_ai(prompt):
     except Exception as e:
         return None, f"AI Error: {e}"
 
-def create_word_docx(text, title="Legal Brief"):
+def create_word_docx(text, title="Legal Document"):
     doc = Document()
     doc.add_heading(title, 0)
     doc.add_paragraph(text)
@@ -129,6 +132,14 @@ if 'form_data' not in st.session_state:
     }
 if 'chat_history' not in st.session_state:
     st.session_state.chat_history = []
+    
+# NEW: Session State for Notice Reply Workflow
+if 'notice_text' not in st.session_state:
+    st.session_state.notice_text = ""
+if 'suggested_cases' not in st.session_state:
+    st.session_state.suggested_cases = []
+if 'drafted_reply' not in st.session_state:
+    st.session_state.drafted_reply = ""
 
 # --- UI Layout ---
 if not sh or not storage_client:
@@ -137,23 +148,25 @@ if not sh or not storage_client:
 
 st.title("RBS Knowledge Bank ")
 
-tab_dash, tab_search, tab_add, tab_link, tab_chat = st.tabs([
-    "📊 Dashboard", "🔍 Search", "➕ Add Judgment", "🔗 Link & Draft", "💬 Chat with PDF"
+tab_dash, tab_search, tab_add, tab_link, tab_reply, tab_chat = st.tabs([
+    "📊 Dashboard", "🔍 Search", "➕ Add Judgment", "🔗 Link to Case", "📝 Draft Notice Reply", "💬 Chat with PDF"
 ])
 
 # ==========================================
-# TAB 1: DASHBOARD & ANALYTICS
+# TAB 1: DASHBOARD
 # ==========================================
 with tab_dash:
     st.header("Firm Knowledge Analytics")
     try:
         j_data = sh.worksheet("Judgments").get_all_records()
         i_data = sh.worksheet("Internal Usage").get_all_records()
+        r_data = sh.worksheet("Notice Replies").get_all_records()
         df_j = pd.DataFrame(j_data)
         
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         col1.metric("Total Judgments Banked", len(j_data))
-        col2.metric("Internal Matter Links", len(i_data))
+        col2.metric("Quick Links", len(i_data))
+        col3.metric("Drafted Notice Replies", len(r_data))
         
         if not df_j.empty:
             st.markdown("---")
@@ -174,12 +187,11 @@ with tab_dash:
         st.info("Add your first judgment to populate the dashboard.")
 
 # ==========================================
-# TAB 2: SEARCH & FILTER
+# TAB 2: SEARCH
 # ==========================================
 with tab_search:
     st.header("Search and Filter Judgments")
     search_term = st.text_input("Universal Search (Case Name, Facts, Decision):").lower()
-    
     try:
         judgments = sh.worksheet("Judgments").get_all_records()
         internal_uses = sh.worksheet("Internal Usage").get_all_records()
@@ -204,20 +216,9 @@ with tab_search:
                 with st.expander(f"{status} | {c_name} | {row.get('Act Name')} - Sec {row.get('Section Number')}"):
                     if "🛑" in status:
                         st.error("WARNING: This judgment has been marked as Overruled or Bad Law.")
-                    
                     st.markdown(f"**Authority:** {row.get('Authority')}")
                     st.markdown(f"**Brief Facts:**\n{row.get('Brief Facts')}")
                     st.markdown(f"**Decision Held:**\n{row.get('Decision Held')}")
-                    
-                    linked_uses = [u for u in internal_uses if str(u.get('Judgment ID')) == str(j_id)]
-                    if linked_uses:
-                        st.markdown("---")
-                        st.markdown("**📌 Internal Usage:**")
-                        for use in linked_uses:
-                            st.markdown(f"- Used in: **{use.get('Internal Matter Name')}**")
-                            if use.get('AI Brief'):
-                                docx_file = create_word_docx(use['AI Brief'], f"Brief - {c_name}")
-                                st.download_button("📄 Export Brief to Word", data=docx_file, file_name=f"Brief_{c_name}.docx", key=f"w_{j_id}_{use['ID']}")
                     
                     file_ids = str(row.get("PDF File IDs", "")).split(",")
                     if file_ids and file_ids[0] != "":
@@ -227,8 +228,6 @@ with tab_search:
                                 file_bytes = download_from_gcs(fid.strip())
                                 if file_bytes:
                                     st.download_button(label=f"⬇️ Download PDF {idx+1}", data=file_bytes, file_name=fid.strip(), mime="application/pdf", key=f"dl_{fid}")
-                                else:
-                                    st.warning("Failed to load PDF ")
     except Exception as e:
         st.warning("Could not fetch records.")
 
@@ -239,8 +238,8 @@ with tab_add:
     st.header("1. Upload & AI Auto-Fill")
     uploaded_files = st.file_uploader("Upload Judgments (PDF)", type=["pdf"], accept_multiple_files=True)
     
-    if st.button("AI: Read PDFs & Auto-Fill"):
-        if uploaded_files and api_key:
+    if st.button("🤖 AI: Read PDFs & Auto-Fill"):
+        if uploaded_files:
             with st.spinner("Extracting details..."):
                 pdf_text = extract_text_from_buffers(uploaded_files)
                 prompt = f"""Extract details from this judgment into JSON format ONLY with keys: "case_name", "act_name", "section_number", "authority", "brief_facts", "decision_held", "ai_notes". Text: {pdf_text[:30000]}"""
@@ -254,9 +253,9 @@ with tab_add:
                     except:
                         st.error("AI output formatting failed. Fill manually.")
         else:
-            st.warning("Upload files and enter API key.")
+            st.warning("Upload files first.")
 
-    st.header("2. Review & Save")
+    st.header("2. Review & Save to Cloud")
     with st.form("add_judgment_form", clear_on_submit=False):
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -272,12 +271,11 @@ with tab_add:
         decision_held = st.text_area("Decision Held *", value=st.session_state.form_data["decision_held"])
         ai_notes = st.text_area("AI Notes", value=st.session_state.form_data["ai_notes"])
         
-        if st.form_submit_button("✅ Save "):
+        if st.form_submit_button("✅ Upload & Save to Cloud"):
             if case_name and brief_facts and decision_held:
                 with st.spinner("Uploading to Google Cloud Storage and saving to Sheets..."):
                     j_id = str(int(time.time()))
                     gcs_file_ids = []
-                    
                     if uploaded_files:
                         for f in uploaded_files:
                             file_buffer = BytesIO(f.getbuffer())
@@ -286,54 +284,154 @@ with tab_add:
                     
                     row_data = [j_id, case_name, act_name, section_num, authority, brief_facts, decision_held, ",".join(gcs_file_ids), ai_notes, status]
                     sh.worksheet("Judgments").append_row(row_data)
-                    
                     st.session_state.form_data = {k: "" for k in st.session_state.form_data}
                     st.success("Saved successfully to the Cloud!")
 
 # ==========================================
-# TAB 4: LINK TO INTERNAL CASE
+# TAB 4: QUICK LINK (Original Link Feature)
 # ==========================================
 with tab_link:
-    st.header("Mark Judgment & Draft AI Brief")
+    st.header("Quick Link Precedent to Internal Matter")
     try:
         judgments = sh.worksheet("Judgments").get_all_records()
         if judgments:
             j_dict = {f"{r['Status']} {r['Case Name']}": r for r in judgments}
             selected_j = st.selectbox("Select Precedent", options=list(j_dict.keys()))
-            j_data = j_dict[selected_j]
+            internal_case_name = st.text_input("Internal Matter / Client Name *", key="quick_matter")
+            notes = st.text_area("Your Strategy/Notes", height=100, key="quick_notes")
             
-            if "🛑" in j_data['Status']:
-                st.error("⚠️ WARNING: You are attempting to rely on a case marked as OVERRULED/BAD LAW.")
-                
-            internal_case_name = st.text_input("Internal Matter / Client Name *")
-            notice = st.text_area("Legal Notice (Text)", height=150)
-            notes = st.text_area("Your Strategy/Notes", height=100)
-            draft_ai = st.checkbox("🤖 Use AI to draft brief")
-            
-            if st.button("Process & Save Link"):
+            if st.button("Process & Save Link", key="quick_btn"):
                 if internal_case_name:
-                    ai_brief_text = ""
-                    if draft_ai and notice:
-                        with st.spinner("Drafting brief..."):
-                            prompt = f"Matter: '{internal_case_name}'. Notice: '{notice}'. Strategy: {notes}. Precedent Facts: {j_data['Brief Facts']}. Precedent Decision: {j_data['Decision Held']}. Draft a professional 3 paragraph legal brief applying precedent to notice."
-                            ai_brief_text, err = ask_ai(prompt)
-                    
                     usage_id = str(int(time.time()))
-                    row_data = [usage_id, str(j_data['ID']), internal_case_name, notice, notes, ai_brief_text]
+                    row_data = [usage_id, str(j_dict[selected_j]['ID']), internal_case_name, "N/A", notes, "N/A"]
                     sh.worksheet("Internal Usage").append_row(row_data)
-                    
                     st.success("Linked in Google Sheets!")
-                    if ai_brief_text:
-                        st.info(ai_brief_text)
-                        docx_file = create_word_docx(ai_brief_text, f"Brief - {internal_case_name}")
-                        st.download_button("📄 Download Brief as Word", data=docx_file, file_name=f"Brief_{internal_case_name}.docx")
         else:
-            st.info("No judgments found in Google Sheets.")
+            st.info("No judgments found.")
     except Exception as e:
         st.error("Error connecting to Google Sheets.")
 
 # ==========================================
-# TAB 5: CHAT WITH PDF
+# TAB 5: DRAFT NOTICE REPLY (NEW FEATURE)
+# ==========================================
+with tab_reply:
+    st.header("📝 Step 1: Analyze Notice & Find Precedents")
+    notice_files = st.file_uploader("Upload Legal Notice(s) received (PDF)", type=["pdf"], accept_multiple_files=True, key="notice_uploader")
+    
+    if st.button("🔍 Read Notice & Suggest Judgments"):
+        if notice_files:
+            with st.spinner("Reading Notice and searching Knowledge Bank..."):
+                st.session_state.notice_text = extract_text_from_buffers(notice_files)
+                
+                # Fetch all Good Law judgments from DB
+                all_judgments = sh.worksheet("Judgments").get_all_records()
+                good_law_catalog = ""
+                for j in all_judgments:
+                    if "Good Law" in j.get("Status", ""):
+                        good_law_catalog += f"ID: {j['ID']} | Case: {j['Case Name']} | Facts: {j['Brief Facts']} | Decision: {j['Decision Held']}\n\n"
+                
+                prompt = f"""
+                You are a senior litigation attorney. 
+                Read this legal notice: {st.session_state.notice_text[:15000]}
+                
+                Here is a catalog of precedents in our firm's database:
+                {good_law_catalog[:30000]}
+                
+                Identify the best precedents to use to defend against or reply to this notice. 
+                Return ONLY a valid JSON list of the exact Case Names you recommend. Example: ["Case A", "Case B"]
+                """
+                res, err = ask_ai(prompt)
+                
+                if not err:
+                    try:
+                        suggested_names = json.loads(res.replace("```json", "").replace("```", "").strip())
+                        st.session_state.suggested_cases = suggested_names
+                        st.success("Analysis complete! See suggestions below.")
+                    except:
+                        st.warning("AI suggested cases, but formatting was slightly off. Please select manually below.")
+        else:
+            st.warning("Please upload a notice first.")
+
+    st.markdown("---")
+    st.header("📝 Step 2: Build Your Argument")
+    
+    try:
+        all_judgments = sh.worksheet("Judgments").get_all_records()
+        all_case_names = [j['Case Name'] for j in all_judgments]
+        
+        # Pre-select the cases the AI suggested (if they exist in the DB)
+        default_selections = [c for c in st.session_state.suggested_cases if c in all_case_names]
+        
+        selected_internal = st.multiselect("Select Internal Precedents to include:", options=all_case_names, default=default_selections)
+        
+        st.markdown("**Add External References (Optional):**")
+        external_refs = st.text_area("Type any outside case laws or specific arguments you want included in the draft:")
+        
+        if st.button("✍️ Draft Reply"):
+            if st.session_state.notice_text:
+                with st.spinner("Drafting your response..."):
+                    # Gather full details of selected internal cases
+                    selected_details = ""
+                    for j in all_judgments:
+                        if j['Case Name'] in selected_internal:
+                            selected_details += f"Case: {j['Case Name']}\nRuling: {j['Decision Held']}\n\n"
+                    
+                    draft_prompt = f"""
+                    You are an expert legal counsel. Draft a formal, professional legal reply to the following notice.
+                    
+                    Original Notice received:
+                    {st.session_state.notice_text[:15000]}
+                    
+                    You MUST cite and apply these internal precedents to support our position:
+                    {selected_details}
+                    
+                    You MUST ALSO incorporate these specific external notes/references:
+                    {external_refs}
+                    
+                    Draft the full body of the legal reply. Use standard legal formatting and authoritative tone.
+                    """
+                    
+                    draft_res, err = ask_ai(draft_prompt)
+                    if not err:
+                        st.session_state.drafted_reply = draft_res
+            else:
+                st.error("Please upload and analyze a Notice in Step 1 first.")
+
+    except Exception as e:
+        st.error("Error loading precedents.")
+
+    st.markdown("---")
+    st.header("📝 Step 3: Review, Edit, and Save")
+    
+    matter_name = st.text_input("Matter / Client Name (For tracking):")
+    final_draft = st.text_area("Edit your Final Reply:", value=st.session_state.drafted_reply, height=400)
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("💾 Save Record to Knowledge Bank"):
+            if matter_name and final_draft:
+                with st.spinner("Saving to Google Sheets..."):
+                    record_id = str(int(time.time()))
+                    row_data = [
+                        record_id, 
+                        matter_name, 
+                        st.session_state.notice_text, 
+                        ", ".join(selected_internal), 
+                        external_refs, 
+                        final_draft
+                    ]
+                    sh.worksheet("Notice Replies").append_row(row_data)
+                    st.success("Notice and Reply successfully recorded!")
+            else:
+                st.error("Please provide a Matter Name and ensure the draft is not empty.")
+    
+    with col2:
+        if final_draft:
+            docx_file = create_word_docx(final_draft, f"Reply to Notice - {matter_name}")
+            st.download_button("📄 Download Reply as Word (.docx)", data=docx_file, file_name=f"Draft_Reply_{matter_name}.docx")
+
+# ==========================================
+# TAB 6: CHAT WITH PDF
 # ==========================================
 with tab_chat:
     st.header("💬 Interactive Q&A with Judgments")
@@ -344,9 +442,9 @@ with tab_chat:
             selected_chat_j = st.selectbox("Select a Judgment to Chat with:", options=list(c_dict.keys()))
             
             user_question = st.text_input("Ask a question about this specific judgment:")
-            if st.button("Ask AI"):
-                if user_question and api_key:
-                    with st.spinner("Fetching PDF from Google Cloud Storage and analyzing..."):
+            if st.button("Ask AI", key="chat_btn"):
+                if user_question:
+                    with st.spinner("Fetching PDF from Cloud Storage and analyzing..."):
                         file_ids = str(c_dict[selected_chat_j]["PDF File IDs"]).split(",")
                         doc_text = ""
                         for fid in file_ids:
@@ -360,20 +458,13 @@ with tab_chat:
                         if doc_text:
                             prompt = f"Based ONLY on the following legal judgment text, answer this question: {user_question}\n\nJudgment Text:\n{doc_text[:35000]}"
                             answer, err = ask_ai(prompt)
-                            if err:
-                                st.error(err)
-                            else:
+                            if not err:
                                 st.session_state.chat_history.append({"q": user_question, "a": answer})
                         else:
                             st.error("Could not extract text from the Cloud Storage files.")
-                elif not api_key:
-                    st.warning("API Key required.")
-                    
             for chat in reversed(st.session_state.chat_history):
                 st.markdown(f"**🧑‍⚖️ You:** {chat['q']}")
                 st.info(f"**🤖 AI:** {chat['a']}")
                 st.markdown("---")
-        else:
-            st.info("No judgments with uploaded PDFs found.")
     except Exception as e:
         st.warning("Error fetching data.")
