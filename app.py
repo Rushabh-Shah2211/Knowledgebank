@@ -10,16 +10,15 @@ from docx import Document
 from google import genai
 import gspread
 from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
+from google.cloud import storage
 
 st.set_page_config(page_title="Enterprise Legal Knowledge Bank", layout="wide", page_icon="🏛️")
 
 # --- Authentication & Cloud Setup ---
-# We load the secrets from Render Environment Variables
+# Loaded from Render Environment Variables
 GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 SHEET_ID = os.environ.get("SPREADSHEET_ID")
-DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID")
+GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME")
 
 # Sidebar for AI API Key
 st.sidebar.header("⚙️ Settings")
@@ -29,31 +28,28 @@ if api_key:
 
 @st.cache_resource
 def get_google_clients():
-    """Authenticates and returns Google Sheets and Drive clients."""
-    if not GOOGLE_CREDS_JSON or not SHEET_ID or not DRIVE_FOLDER_ID:
+    """Authenticates and returns Google Sheets and Cloud Storage clients."""
+    if not GOOGLE_CREDS_JSON or not SHEET_ID or not GCS_BUCKET_NAME:
         return None, None
     
     try:
         creds_dict = json.loads(GOOGLE_CREDS_JSON)
-        scopes = [
-            'https://www.googleapis.com/auth/spreadsheets',
-            'https://www.googleapis.com/auth/drive'
-        ]
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
         
         # Sheets Client
-        gc = gspread.authorize(creds)
+        scopes = ['https://www.googleapis.com/auth/spreadsheets']
+        sheet_creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        gc = gspread.authorize(sheet_creds)
         sh = gc.open_by_key(SHEET_ID)
         
-        # Drive Client
-        drive_service = build('drive', 'v3', credentials=creds)
+        # Cloud Storage Client
+        storage_client = storage.Client.from_service_account_info(creds_dict)
         
-        return sh, drive_service
+        return sh, storage_client
     except Exception as e:
         st.error(f"Google Auth Error: {e}")
         return None, None
 
-sh, drive_service = get_google_clients()
+sh, storage_client = get_google_clients()
 
 def init_sheets():
     """Ensures headers exist in Google Sheets."""
@@ -72,28 +68,25 @@ def init_sheets():
 if sh:
     init_sheets()
 
-# --- Google Drive File Handlers ---
-def upload_to_drive(file_buffer, file_name):
-    """Uploads a file buffer to Google Drive and returns the File ID."""
+# --- Google Cloud Storage File Handlers ---
+def upload_to_gcs(file_buffer, file_name):
+    """Uploads a file buffer to Google Cloud Storage and returns the filename."""
     try:
-        media = MediaIoBaseUpload(file_buffer, mimetype='application/pdf', resumable=True)
-        file_metadata = {'name': file_name, 'parents': [DRIVE_FOLDER_ID]}
-        file = drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-        return file.get('id')
+        bucket = storage_client.bucket(GCS_BUCKET_NAME)
+        blob = bucket.blob(file_name)
+        file_buffer.seek(0)
+        blob.upload_from_file(file_buffer, content_type='application/pdf')
+        return file_name # In GCS, the filename acts as the ID
     except Exception as e:
-        st.error(f"Drive Upload Error: {e}")
+        st.error(f"GCS Upload Error: {e}")
         return None
 
-def download_from_drive(file_id):
-    """Downloads a file from Google Drive into memory."""
+def download_from_gcs(file_name):
+    """Downloads a file from Google Cloud Storage into memory."""
     try:
-        request = drive_service.files().get_media(fileId=file_id)
-        fh = BytesIO()
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
-        while not done:
-            status, done = downloader.next_chunk()
-        return fh.getvalue()
+        bucket = storage_client.bucket(GCS_BUCKET_NAME)
+        blob = bucket.blob(file_name)
+        return blob.download_as_bytes()
     except Exception as e:
         return None
 
@@ -102,6 +95,7 @@ def extract_text_from_buffers(pdf_buffers):
     text = ""
     for pdf_buffer in pdf_buffers:
         try:
+            pdf_buffer.seek(0)
             reader = PyPDF2.PdfReader(pdf_buffer)
             for page in reader.pages:
                 extracted = page.extract_text()
@@ -142,7 +136,7 @@ if 'chat_history' not in st.session_state:
     st.session_state.chat_history = []
 
 # --- UI Layout ---
-if not sh:
+if not sh or not storage_client:
     st.error("🚨 System not connected to Google Cloud. Please configure Environment Variables on Render.")
     st.stop()
 
@@ -203,7 +197,7 @@ with tab_search:
                     search_term in str(row.get('Decision Held', '')).lower()):
                     results.append(row)
         else:
-            results = judgments # Show all if no search
+            results = judgments
             
         if results:
             st.success(f"Showing {len(results)} judgment(s).")
@@ -220,7 +214,6 @@ with tab_search:
                     st.markdown(f"**Brief Facts:**\n{row.get('Brief Facts')}")
                     st.markdown(f"**Decision Held:**\n{row.get('Decision Held')}")
                     
-                    # Match Internal Usage
                     linked_uses = [u for u in internal_uses if str(u.get('Judgment ID')) == str(j_id)]
                     if linked_uses:
                         st.markdown("---")
@@ -231,17 +224,16 @@ with tab_search:
                                 docx_file = create_word_docx(use['AI Brief'], f"Brief - {c_name}")
                                 st.download_button("📄 Export Brief to Word", data=docx_file, file_name=f"Brief_{c_name}.docx", key=f"w_{j_id}_{use['ID']}")
                     
-                    # PDF Downloads from Drive
                     file_ids = str(row.get("PDF File IDs", "")).split(",")
                     if file_ids and file_ids[0] != "":
                         st.markdown("**Attachments:**")
                         for idx, fid in enumerate(file_ids):
                             if fid.strip():
-                                file_bytes = download_from_drive(fid.strip())
+                                file_bytes = download_from_gcs(fid.strip())
                                 if file_bytes:
-                                    st.download_button(label=f"⬇️ Download PDF {idx+1}", data=file_bytes, file_name=f"Judgment_{j_id}_{idx+1}.pdf", mime="application/pdf", key=f"dl_{fid}")
+                                    st.download_button(label=f"⬇️ Download PDF {idx+1}", data=file_bytes, file_name=fid.strip(), mime="application/pdf", key=f"dl_{fid}")
                                 else:
-                                    st.warning("Failed to load PDF from Drive.")
+                                    st.warning("Failed to load PDF from Cloud Storage.")
     except Exception as e:
         st.warning("Could not fetch records.")
 
@@ -285,19 +277,19 @@ with tab_add:
         decision_held = st.text_area("Decision Held *", value=st.session_state.form_data["decision_held"])
         ai_notes = st.text_area("AI Notes", value=st.session_state.form_data["ai_notes"])
         
-        if st.form_submit_button("✅ Upload & Save to Google Sheets"):
+        if st.form_submit_button("✅ Upload & Save to Cloud"):
             if case_name and brief_facts and decision_held:
-                with st.spinner("Uploading to Google Drive and saving to Sheets..."):
+                with st.spinner("Uploading to Google Cloud Storage and saving to Sheets..."):
                     j_id = str(int(time.time()))
-                    drive_file_ids = []
+                    gcs_file_ids = []
                     
                     if uploaded_files:
                         for f in uploaded_files:
                             file_buffer = BytesIO(f.getbuffer())
-                            fid = upload_to_drive(file_buffer, f"{j_id}_{f.name}")
-                            if fid: drive_file_ids.append(fid)
+                            fid = upload_to_gcs(file_buffer, f"{j_id}_{f.name}")
+                            if fid: gcs_file_ids.append(fid)
                     
-                    row_data = [j_id, case_name, act_name, section_num, authority, brief_facts, decision_held, ",".join(drive_file_ids), ai_notes, status]
+                    row_data = [j_id, case_name, act_name, section_num, authority, brief_facts, decision_held, ",".join(gcs_file_ids), ai_notes, status]
                     sh.worksheet("Judgments").append_row(row_data)
                     
                     st.session_state.form_data = {k: "" for k in st.session_state.form_data}
@@ -359,12 +351,12 @@ with tab_chat:
             user_question = st.text_input("Ask a question about this specific judgment:")
             if st.button("Ask AI"):
                 if user_question and api_key:
-                    with st.spinner("Fetching PDF from Google Drive and analyzing..."):
+                    with st.spinner("Fetching PDF from Google Cloud Storage and analyzing..."):
                         file_ids = str(c_dict[selected_chat_j]["PDF File IDs"]).split(",")
                         doc_text = ""
                         for fid in file_ids:
                             if fid.strip():
-                                pdf_bytes = download_from_drive(fid.strip())
+                                pdf_bytes = download_from_gcs(fid.strip())
                                 if pdf_bytes:
                                     reader = PyPDF2.PdfReader(BytesIO(pdf_bytes))
                                     for page in reader.pages:
@@ -378,11 +370,10 @@ with tab_chat:
                             else:
                                 st.session_state.chat_history.append({"q": user_question, "a": answer})
                         else:
-                            st.error("Could not extract text from the Drive files.")
+                            st.error("Could not extract text from the Cloud Storage files.")
                 elif not api_key:
                     st.warning("API Key required.")
                     
-            # Display Chat History
             for chat in reversed(st.session_state.chat_history):
                 st.markdown(f"**🧑‍⚖️ You:** {chat['q']}")
                 st.info(f"**🤖 AI:** {chat['a']}")
