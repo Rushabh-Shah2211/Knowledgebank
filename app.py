@@ -12,7 +12,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from google.cloud import storage
 
-st.set_page_config(page_title="RBS Legal Knowledge Bank", layout="wide", page_icon="🏛️")
+st.set_page_config(page_title="RBS Knowledge Corner", layout="wide", page_icon="🏛️")
 
 # --- Authentication & Cloud Setup ---
 GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
@@ -55,7 +55,6 @@ def init_sheets():
             if not internal_sheet.row_values(1):
                 internal_sheet.append_row(["ID", "Judgment ID", "Internal Matter Name", "Internal Notice", "Usage Notes", "AI Brief"])
                 
-            # NEW: Notice Replies Sheet
             if "Notice Replies" not in worksheet_titles:
                 sh.add_worksheet(title="Notice Replies", rows="1000", cols="10")
             notice_sheet = sh.worksheet("Notice Replies")
@@ -132,8 +131,6 @@ if 'form_data' not in st.session_state:
     }
 if 'chat_history' not in st.session_state:
     st.session_state.chat_history = []
-    
-# NEW: Session State for Notice Reply Workflow
 if 'notice_text' not in st.session_state:
     st.session_state.notice_text = ""
 if 'suggested_cases' not in st.session_state:
@@ -146,17 +143,17 @@ if not sh or not storage_client:
     st.error("🚨 System not connected to Google Cloud. Please configure Environment Variables on Render.")
     st.stop()
 
-st.title("RBS Knowledge Bank ")
+st.title("🏛️ RBS Knowledge Corner")
 
-tab_dash, tab_search, tab_add, tab_link, tab_reply, tab_chat = st.tabs([
-    "📊 Dashboard", "🔍 Search", "➕ Add Judgment", "🔗 Link to Case", "📝 Draft Notice Reply", "💬 Chat with PDF"
+tab_dash, tab_search, tab_matters, tab_add, tab_reply, tab_chat = st.tabs([
+    "📊 Dashboard", "🔍 Search & Edit", "📂 Internal Matters", "➕ Add Judgment", "📝 Draft Reply", "💬 Chat with PDF"
 ])
 
 # ==========================================
 # TAB 1: DASHBOARD
 # ==========================================
 with tab_dash:
-    st.header("Firm Knowledge Analytics")
+    st.header("Firm Analytics")
     try:
         j_data = sh.worksheet("Judgments").get_all_records()
         i_data = sh.worksheet("Internal Usage").get_all_records()
@@ -184,17 +181,19 @@ with tab_dash:
                     fig3 = px.pie(df_j, names='Status', title='Law Status Distribution')
                     st.plotly_chart(fig3, use_container_width=True)
     except Exception as e:
-        st.info("Add your first judgment to populate the dashboard.")
+        st.info("Dashboard will populate as data is added.")
 
 # ==========================================
-# TAB 2: SEARCH
+# TAB 2: SEARCH, EDIT & LOGS
 # ==========================================
 with tab_search:
-    st.header("Search and Filter Judgments")
+    st.header("Search, Edit, and Review Logs")
     search_term = st.text_input("Universal Search (Case Name, Facts, Decision):").lower()
     try:
-        judgments = sh.worksheet("Judgments").get_all_records()
+        judgments_sheet = sh.worksheet("Judgments")
+        judgments = judgments_sheet.get_all_records()
         internal_uses = sh.worksheet("Internal Usage").get_all_records()
+        replies = sh.worksheet("Notice Replies").get_all_records()
         
         results = []
         if search_term:
@@ -216,10 +215,54 @@ with tab_search:
                 with st.expander(f"{status} | {c_name} | {row.get('Act Name')} - Sec {row.get('Section Number')}"):
                     if "🛑" in status:
                         st.error("WARNING: This judgment has been marked as Overruled or Bad Law.")
+                    
                     st.markdown(f"**Authority:** {row.get('Authority')}")
                     st.markdown(f"**Brief Facts:**\n{row.get('Brief Facts')}")
                     st.markdown(f"**Decision Held:**\n{row.get('Decision Held')}")
                     
+                    # INTERNAL USAGE LOG
+                    st.markdown("---")
+                    st.markdown("### 📋 Internal Usage Log")
+                    use_count = 0
+                    
+                    # Check Quick Links
+                    for use in internal_uses:
+                        if str(use.get('Judgment ID')) == str(j_id):
+                            use_count += 1
+                            st.markdown(f"- **Linked Matter:** {use.get('Internal Matter Name')} | *Notes: {use.get('Usage Notes')}*")
+                    
+                    # Check Replies
+                    for rep in replies:
+                        if c_name in str(rep.get('Internal Judgments Used', '')):
+                            use_count += 1
+                            st.markdown(f"- **Drafted Reply For:** {rep.get('Matter Name')}")
+                            
+                    if use_count == 0:
+                        st.caption("This judgment has not been cited in any internal matters yet.")
+                    
+                    # EDIT FUNCTIONALITY
+                    st.markdown("---")
+                    edit_mode = st.checkbox(f"✏️ Edit '{c_name}'", key=f"edit_check_{j_id}")
+                    if edit_mode:
+                        with st.form(f"edit_form_{j_id}"):
+                            e_c_name = st.text_input("Case Name", value=c_name)
+                            e_act = st.text_input("Act Name", value=row.get('Act Name'))
+                            e_sec = st.text_input("Section", value=row.get('Section Number'))
+                            e_auth = st.text_input("Authority", value=row.get('Authority'))
+                            e_status = st.selectbox("Status", ["🟢 Good Law", "🟡 Distinguished / Caution", "🛑 Overruled / Bad Law"], index=["🟢 Good Law", "🟡 Distinguished / Caution", "🛑 Overruled / Bad Law"].index(status) if status in ["🟢 Good Law", "🟡 Distinguished / Caution", "🛑 Overruled / Bad Law"] else 0)
+                            e_facts = st.text_area("Brief Facts", value=row.get('Brief Facts'))
+                            e_decision = st.text_area("Decision Held", value=row.get('Decision Held'))
+                            
+                            if st.form_submit_button("💾 Save Changes"):
+                                try:
+                                    cell = judgments_sheet.find(str(j_id))
+                                    # Update cells in the specific row (Columns B through J, assuming A is ID)
+                                    judgments_sheet.update(f"B{cell.row}:J{cell.row}", [[e_c_name, e_act, e_sec, e_auth, e_facts, e_decision, row.get('PDF File IDs'), row.get('AI Notes'), e_status]])
+                                    st.success("Judgment updated successfully! Please refresh to see changes.")
+                                except Exception as e:
+                                    st.error(f"Error updating sheet: {e}")
+
+                    # Attachments
                     file_ids = str(row.get("PDF File IDs", "")).split(",")
                     if file_ids and file_ids[0] != "":
                         st.markdown("**Attachments:**")
@@ -227,12 +270,62 @@ with tab_search:
                             if fid.strip():
                                 file_bytes = download_from_gcs(fid.strip())
                                 if file_bytes:
-                                    st.download_button(label=f"⬇️ Download PDF {idx+1}", data=file_bytes, file_name=fid.strip(), mime="application/pdf", key=f"dl_{fid}")
+                                    st.download_button(label=f"⬇️ Download PDF {idx+1}", data=file_bytes, file_name=f"{c_name}_Part{idx+1}.pdf", mime="application/pdf", key=f"dl_{fid}")
     except Exception as e:
         st.warning("Could not fetch records.")
 
 # ==========================================
-# TAB 3: ADD NEW JUDGMENT
+# TAB 3: INTERNAL MATTERS DASHBOARD
+# ==========================================
+with tab_matters:
+    st.header("📂 Internal Client Matters & Submissions")
+    st.markdown("Review all active and historical matters your firm has logged.")
+    
+    try:
+        replies_data = sh.worksheet("Notice Replies").get_all_records()
+        links_data = sh.worksheet("Internal Usage").get_all_records()
+        
+        # Combine unique matter names
+        all_matters = list(set([r.get('Matter Name') for r in replies_data if r.get('Matter Name')] + 
+                               [l.get('Internal Matter Name') for l in links_data if l.get('Internal Matter Name')]))
+        
+        if all_matters:
+            selected_matter = st.selectbox("Select a Matter / Client to Review:", ["-- Select --"] + sorted(all_matters))
+            
+            if selected_matter != "-- Select --":
+                st.markdown(f"### Matter: {selected_matter}")
+                
+                # Show Drafted Replies for this matter
+                matter_replies = [r for r in replies_data if r.get('Matter Name') == selected_matter]
+                if matter_replies:
+                    st.subheader("📝 Notice Replies & Submissions")
+                    for rep in matter_replies:
+                        with st.expander(f"Reply Drafted (ID: {rep.get('ID')})"):
+                            st.markdown("**Original Notice Received:**")
+                            st.caption(rep.get('Notice Text')[:500] + "...")
+                            st.markdown(f"**RBS Precedents Used:** {rep.get('Internal Judgments Used')}")
+                            st.markdown(f"**External References:** {rep.get('External References')}")
+                            st.markdown("**Final Reply:**")
+                            st.info(rep.get('Final Reply'))
+                            
+                            docx_file = create_word_docx(rep.get('Final Reply'), f"Reply - {selected_matter}")
+                            st.download_button("📄 Download Reply as Word", data=docx_file, file_name=f"Reply_{selected_matter}.docx", key=f"dl_rep_{rep.get('ID')}")
+                
+                # Show Quick Links for this matter
+                matter_links = [l for l in links_data if l.get('Internal Matter Name') == selected_matter]
+                if matter_links:
+                    st.subheader("🔗 Linked Research & Precedents")
+                    for link in matter_links:
+                        st.markdown(f"- **Judgment ID Cited:** {link.get('Judgment ID')}")
+                        st.markdown(f"  - *Strategy/Notes:* {link.get('Usage Notes')}")
+        else:
+            st.info("No internal matters have been logged yet. Use the 'Draft Reply' tab to start.")
+            
+    except Exception as e:
+        st.error(f"Error loading internal matters: {e}")
+
+# ==========================================
+# TAB 4: ADD NEW JUDGMENT
 # ==========================================
 with tab_add:
     st.header("1. Upload & AI Auto-Fill")
@@ -288,42 +381,17 @@ with tab_add:
                     st.success("Saved successfully to the Cloud!")
 
 # ==========================================
-# TAB 4: QUICK LINK (Original Link Feature)
-# ==========================================
-with tab_link:
-    st.header("Quick Link Precedent to Internal Matter")
-    try:
-        judgments = sh.worksheet("Judgments").get_all_records()
-        if judgments:
-            j_dict = {f"{r['Status']} {r['Case Name']}": r for r in judgments}
-            selected_j = st.selectbox("Select Precedent", options=list(j_dict.keys()))
-            internal_case_name = st.text_input("Internal Matter / Client Name *", key="quick_matter")
-            notes = st.text_area("Your Strategy/Notes", height=100, key="quick_notes")
-            
-            if st.button("Process & Save Link", key="quick_btn"):
-                if internal_case_name:
-                    usage_id = str(int(time.time()))
-                    row_data = [usage_id, str(j_dict[selected_j]['ID']), internal_case_name, "N/A", notes, "N/A"]
-                    sh.worksheet("Internal Usage").append_row(row_data)
-                    st.success("Linked in Google Sheets!")
-        else:
-            st.info("No judgments found.")
-    except Exception as e:
-        st.error("Error connecting to Google Sheets.")
-
-# ==========================================
-# TAB 5: DRAFT NOTICE REPLY (NEW FEATURE)
+# TAB 5: DRAFT NOTICE REPLY
 # ==========================================
 with tab_reply:
-    st.header("📝 Step 1: Analyze Notice & Find Precedents")
+    st.header("📝 Step 1: Analyze Notice")
     notice_files = st.file_uploader("Upload Legal Notice(s) received (PDF)", type=["pdf"], accept_multiple_files=True, key="notice_uploader")
     
-    if st.button("🔍 Read Notice & Suggest Judgments"):
+    if st.button("🔍 Read Notice & Suggest Strategies"):
         if notice_files:
-            with st.spinner("Reading Notice and searching Knowledge Bank..."):
+            with st.spinner("Reading Notice and searching RBS Knowledge Corner..."):
                 st.session_state.notice_text = extract_text_from_buffers(notice_files)
                 
-                # Fetch all Good Law judgments from DB
                 all_judgments = sh.worksheet("Judgments").get_all_records()
                 good_law_catalog = ""
                 for j in all_judgments:
@@ -334,21 +402,26 @@ with tab_reply:
                 You are a senior litigation attorney. 
                 Read this legal notice: {st.session_state.notice_text[:15000]}
                 
-                Here is a catalog of precedents in our firm's database:
+                Task 1: Identify the best internal precedents from this catalog:
                 {good_law_catalog[:30000]}
                 
-                Identify the best precedents to use to defend against or reply to this notice. 
-                Return ONLY a valid JSON list of the exact Case Names you recommend. Example: ["Case A", "Case B"]
+                Task 2: Suggest 2 or 3 major EXTERNAL landmark legal precedents (not in the catalog) that are highly relevant to defending against this notice.
+                
+                Return ONLY a valid JSON object with two keys:
+                "internal_cases": [list of exact Case Names from the catalog]
+                "external_suggestions": [list of external case names and a 1-sentence explanation of why]
                 """
                 res, err = ask_ai(prompt)
                 
                 if not err:
                     try:
-                        suggested_names = json.loads(res.replace("```json", "").replace("```", "").strip())
-                        st.session_state.suggested_cases = suggested_names
-                        st.success("Analysis complete! See suggestions below.")
+                        suggestions = json.loads(res.replace("```json", "").replace("```", "").strip())
+                        st.session_state.suggested_cases = suggestions.get("internal_cases", [])
+                        st.success("Analysis complete!")
+                        if suggestions.get("external_suggestions"):
+                            st.info("**AI Suggested External Precedents:**\n" + "\n".join(suggestions.get("external_suggestions", [])))
                     except:
-                        st.warning("AI suggested cases, but formatting was slightly off. Please select manually below.")
+                        st.warning("AI provided suggestions, but formatting was off. Please select manually below.")
         else:
             st.warning("Please upload a notice first.")
 
@@ -358,19 +431,16 @@ with tab_reply:
     try:
         all_judgments = sh.worksheet("Judgments").get_all_records()
         all_case_names = [j['Case Name'] for j in all_judgments]
-        
-        # Pre-select the cases the AI suggested (if they exist in the DB)
         default_selections = [c for c in st.session_state.suggested_cases if c in all_case_names]
         
-        selected_internal = st.multiselect("Select Internal Precedents to include:", options=all_case_names, default=default_selections)
+        selected_internal = st.multiselect("Select RBS Precedents to include:", options=all_case_names, default=default_selections)
         
-        st.markdown("**Add External References (Optional):**")
+        st.markdown("**Add External References (From AI suggestions or your own knowledge):**")
         external_refs = st.text_area("Type any outside case laws or specific arguments you want included in the draft:")
         
         if st.button("✍️ Draft Reply"):
             if st.session_state.notice_text:
                 with st.spinner("Drafting your response..."):
-                    # Gather full details of selected internal cases
                     selected_details = ""
                     for j in all_judgments:
                         if j['Case Name'] in selected_internal:
@@ -385,10 +455,10 @@ with tab_reply:
                     You MUST cite and apply these internal precedents to support our position:
                     {selected_details}
                     
-                    You MUST ALSO incorporate these specific external notes/references:
+                    You MUST ALSO incorporate these specific external precedents/notes:
                     {external_refs}
                     
-                    Draft the full body of the legal reply. Use standard legal formatting and authoritative tone.
+                    Draft the full body of the legal reply. Use standard legal formatting and authoritative tone. Do not use placeholders for dates/names if you can deduce them.
                     """
                     
                     draft_res, err = ask_ai(draft_prompt)
@@ -408,7 +478,7 @@ with tab_reply:
     
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("💾 Save Record to Knowledge Bank"):
+        if st.button("💾 Save to RBS Knowledge Corner"):
             if matter_name and final_draft:
                 with st.spinner("Saving to Google Sheets..."):
                     record_id = str(int(time.time()))
@@ -421,7 +491,7 @@ with tab_reply:
                         final_draft
                     ]
                     sh.worksheet("Notice Replies").append_row(row_data)
-                    st.success("Notice and Reply successfully recorded!")
+                    st.success("Notice and Reply successfully recorded! You can view it in the 'Internal Matters' tab.")
             else:
                 st.error("Please provide a Matter Name and ensure the draft is not empty.")
     
