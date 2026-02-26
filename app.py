@@ -19,12 +19,7 @@ st.set_page_config(page_title="Enterprise Legal Knowledge Bank", layout="wide", 
 GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 SHEET_ID = os.environ.get("SPREADSHEET_ID")
 GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME")
-
-# Sidebar for AI API Key
-st.sidebar.header("⚙️ Settings")
-api_key = st.sidebar.text_input("Enter Gemini API Key (for AI features):", type="password")
-if api_key:
-    st.sidebar.success("✅ API Key registered!")
+api_key = os.environ.get("GEMINI_API_KEY") # Gemini API Key for AI interactions
 
 @st.cache_resource
 def get_google_clients():
@@ -140,7 +135,7 @@ if not sh or not storage_client:
     st.error("🚨 System not connected to Google Cloud. Please configure Environment Variables on Render.")
     st.stop()
 
-st.title("🏛️ Enterprise Legal Knowledge Bank (Cloud)")
+st.title("RBS Knowledge Bank ")
 
 tab_dash, tab_search, tab_add, tab_link, tab_chat = st.tabs([
     "📊 Dashboard", "🔍 Search", "➕ Add Judgment", "🔗 Link & Draft", "💬 Chat with PDF"
@@ -233,7 +228,7 @@ with tab_search:
                                 if file_bytes:
                                     st.download_button(label=f"⬇️ Download PDF {idx+1}", data=file_bytes, file_name=fid.strip(), mime="application/pdf", key=f"dl_{fid}")
                                 else:
-                                    st.warning("Failed to load PDF from Cloud Storage.")
+                                    st.warning("Failed to load PDF ")
     except Exception as e:
         st.warning("Could not fetch records.")
 
@@ -244,7 +239,7 @@ with tab_add:
     st.header("1. Upload & AI Auto-Fill")
     uploaded_files = st.file_uploader("Upload Judgments (PDF)", type=["pdf"], accept_multiple_files=True)
     
-    if st.button("🤖 AI: Read PDFs & Auto-Fill"):
+    if st.button("AI: Read PDFs & Auto-Fill"):
         if uploaded_files and api_key:
             with st.spinner("Extracting details..."):
                 pdf_text = extract_text_from_buffers(uploaded_files)
@@ -261,7 +256,7 @@ with tab_add:
         else:
             st.warning("Upload files and enter API key.")
 
-    st.header("2. Review & Save to Cloud")
+    st.header("2. Review & Save")
     with st.form("add_judgment_form", clear_on_submit=False):
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -277,7 +272,7 @@ with tab_add:
         decision_held = st.text_area("Decision Held *", value=st.session_state.form_data["decision_held"])
         ai_notes = st.text_area("AI Notes", value=st.session_state.form_data["ai_notes"])
         
-        if st.form_submit_button("✅ Upload & Save to Cloud"):
+        if st.form_submit_button("✅ Save "):
             if case_name and brief_facts and decision_held:
                 with st.spinner("Uploading to Google Cloud Storage and saving to Sheets..."):
                     j_id = str(int(time.time()))
